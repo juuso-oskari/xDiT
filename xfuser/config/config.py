@@ -70,6 +70,7 @@ class RuntimeConfig:
     spargeattn_cdfthreshold: float = 0.92
     use_spargeattn_head_balance: bool = False
     use_fp8_comms: bool = False
+    use_mxfp4_comms: bool = False
     fp8_comms_scale: Optional[float] = None
 
     def __post_init__(self):

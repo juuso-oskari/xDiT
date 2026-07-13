@@ -168,6 +168,79 @@ def _fp8_comms_input_all_to_all(
     return query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes
 
 
+def _mxfp4_comms_input_all_to_all(query, key, value):
+    """MXFP4 (fp4) Ulysses input all-to-all for the AITER_MXFP4 attention path.
+
+    Quantizes Q/K to mxfp4 *before* the all-to-all and ships the packed fp4
+    tensors (head_dim/2 bytes) + their E8M0 block scales (head_dim/32) instead of
+    bf16 (head_dim*2 bytes) -> ~4x smaller Q/K transfer. The kernel then consumes
+    the pre-quantized Q/K directly (``mxfp4_pre_quantized``), so no
+    dequantize/re-quantize happens on-device after the comms.
+
+    Q/K use ``smooth_rotate_downcast_qk`` (Hadamard rotate + mxfp4 downcast, no
+    K-smoothing). The mxfp4 block scale is per-32-element block *along head_dim*,
+    a purely local reduction, so the result is bit-identical whether quantized
+    before or after the head/sequence all-to-all (which only permutes b/h/s).
+
+    V is left in bf16 over the wire and quantized after the gather: its
+    per-channel fp8 scale is an amax *over the sequence*, which is only correct
+    once the full (post-a2a) sequence is present on the rank.
+
+    Returns ``(query_fp4, key_fp4, value_bf16, attn_kwargs_update)``.
+    """
+    from xfuser.core.distributed.attention_backend import (
+        HADAMARD_MATRIX,
+        AITER_SAGE_V2_BLOCK_R,
+        _AITER_SPARGE_ASM_BLOCK_M,
+    )
+    from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+        smooth_rotate_downcast_qk,
+    )
+
+    head_dim = query.shape[-1]
+    # Fold the softmax scale (head_dim**-0.5) and log2(e) into Q exactly like the
+    # baseline mxfp4 kernel path (_aiter_mxfp4_attn_call -> sage_quant_mxfp4).
+    sm_scale = (head_dim ** -0.5) * 1.4426950408889634
+    R = HADAMARD_MATRIX[query.device]
+
+    import aiter, os
+
+    # V: naive direct fp8 cast (descale = 1). fp8 is floating-point, so its
+    # exponent already spans V's range (validated: identical cosine to a
+    # per-channel amax) -> purely local, no all-reduce, half the bf16 bytes.
+    v_fp8 = value.to(aiter.dtypes.fp8)
+
+    q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(
+        query,
+        key,
+        BLOCK_SIZE_M=_AITER_SPARGE_ASM_BLOCK_M,
+        hadamard_rotation=True,
+        R=R,
+        BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+        q_smoothing=False,
+        layout="bhsd",
+        sm_scale=sm_scale,
+    )
+
+    # Ship fp4 payloads + E8M0 scales. Default: unpacked (each its own a2a) --
+    # simplest, and packing is a wash here (the a2a is bandwidth-bound, and the
+    # mxfp4 kernel needs contiguous q/scale, forcing an unavoidable unpack copy).
+    # Set MXFP4_COMMS_PACK=1 to cat fp4+scale into one a2a per Q/K (A/B only).
+    if os.environ.get("MXFP4_COMMS_PACK", "0") != "0":
+        query = _ft_c_input_all_to_all(torch.cat([q_fp4, q_scale], dim=-1))
+        key = _ft_c_input_all_to_all(torch.cat([k_fp4, k_scale], dim=-1))
+        value = _ft_c_input_all_to_all(v_fp8)
+        attn_kwargs_update = {"mxfp4_pre_quantized": True, "mxfp4_fp4_width": q_fp4.shape[-1]}
+    else:
+        query = _ft_c_input_all_to_all(q_fp4)
+        q_scale = _ft_c_input_all_to_all(q_scale)
+        key = _ft_c_input_all_to_all(k_fp4)
+        k_scale = _ft_c_input_all_to_all(k_scale)
+        value = _ft_c_input_all_to_all(v_fp8)
+        attn_kwargs_update = {"mxfp4_pre_quantized": True, "q_scale": q_scale, "k_scale": k_scale}
+    return query, key, value, attn_kwargs_update
+
+
 def _fp8_comms_output_all_to_all(out: torch.Tensor, o_scale_t: torch.Tensor | None) -> torch.Tensor:
     """Quantize attention output to FP8, run output all-to-all, dequantize back."""
     restore_dtype = out.dtype if out.dtype not in _FP8_DTYPES else torch.bfloat16
@@ -399,6 +472,12 @@ def USP(
                 query, key, value, fp8_q_scale, fp8_k_scale, fp8_v_scale,
             )
             attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
+        elif (
+            get_runtime_state().runtime_config.use_mxfp4_comms
+            and getattr(hb_backend, "name", None) == "AITER_MXFP4"
+        ):
+            query, key, value, mxfp4_kwargs = _mxfp4_comms_input_all_to_all(query, key, value)
+            attention_kwargs = (attention_kwargs or {}) | mxfp4_kwargs
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:

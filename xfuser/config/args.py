@@ -141,6 +141,7 @@ class xFuserArgs:
     fp8_precision_override_prefix_patterns: Optional[str] = None
     fp8_precision_override_suffix_patterns: Optional[str] = None
     use_fp8_comms: bool = False
+    use_mxfp4_comms: bool = False
     fp8_comms_scale: Optional[float] = None
     # Model runner specific
     num_iterations: int = 1
@@ -419,6 +420,13 @@ class xFuserArgs:
             help="Quantize Ulysses all-to-all communication to FP8.",
         )
         runtime_group.add_argument(
+            "--use_mxfp4_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to MXFP4 (fp4) for "
+                 "AITER_MXFP4 attention steps: ship packed fp4 + block scales and "
+                 "skip the post-all-to-all re-quantization.",
+        )
+        runtime_group.add_argument(
             "--fp8_comms_scale",
             type=float,
             default=None,
@@ -651,6 +659,13 @@ class xFuserArgs:
             "--use_fp8_comms",
             action="store_true",
             help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        parser.add_argument(
+            "--use_mxfp4_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to MXFP4 (fp4) for "
+                 "AITER_MXFP4 attention steps: ship packed fp4 + block scales and "
+                 "skip the post-all-to-all re-quantization.",
         )
         parser.add_argument(
             "--fp8_comms_scale",
@@ -938,6 +953,7 @@ class xFuserArgs:
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
             use_spargeattn_head_balance=self.use_spargeattn_head_balance,
             use_fp8_comms=self.use_fp8_comms,
+            use_mxfp4_comms=self.use_mxfp4_comms,
             fp8_comms_scale=self.fp8_comms_scale,
         )
 

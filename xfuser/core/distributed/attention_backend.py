@@ -806,6 +806,47 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
     attention_kwargs = attention_kwargs or {}
     pre_quantized = attention_kwargs.get("pre_quantized", False)
 
+    if attention_kwargs.get("mxfp4_pre_quantized", False):
+        # Q/K arrive already MXFP4 (fp4 payload + E8M0 block scales) from the
+        # mxfp4-comms all-to-all; skip re-quantizing them. Only V needs handling.
+        if "mxfp4_fp4_width" in attention_kwargs:
+            # packed: [fp4 payload | E8M0 scales] on the last dim; split apart.
+            w = attention_kwargs["mxfp4_fp4_width"]
+            q_bshd = torch.permute(query, [0, 2, 1, 3])                              # [b, s, h, d/2 + d/32]
+            k_bshd = torch.permute(key,   [0, 2, 1, 3])
+            qq = q_bshd[..., :w].contiguous()                                       # [b, s, h, d/2] uint8
+            qd = q_bshd[..., w:].contiguous()                                       # [b, s, h, d/32]
+            kq = k_bshd[..., :w].contiguous()
+            kd = k_bshd[..., w:].contiguous()
+        else:
+            # unpacked: fp4 payloads and E8M0 scales arrived as separate tensors.
+            qq = torch.permute(query, [0, 2, 1, 3]).contiguous()                    # [b, s, h, d/2] uint8
+            kq = torch.permute(key,   [0, 2, 1, 3]).contiguous()
+            qd = torch.permute(attention_kwargs["q_scale"], [0, 2, 1, 3]).contiguous()  # [b, s, h, d/32]
+            kd = torch.permute(attention_kwargs["k_scale"], [0, 2, 1, 3]).contiguous()
+        v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()                    # [b, s, h, d]
+        if v_bshd.dtype in _FP8_INPUT_DTYPES:
+            # V arrived naively fp8-cast (descale = 1) from mxfp4-comms: use directly.
+            vq = v_bshd
+            v_scale = torch.ones(
+                v_bshd.shape[0], v_bshd.shape[2], v_bshd.shape[3],
+                device=v_bshd.device, dtype=torch.float32,
+            )                                                                       # [b, h, d]
+        else:
+            # V still bf16 (e.g. mxfp4-comms disabled): per-channel amax over the
+            # now-complete post-a2a sequence, matching sage_quant's V path.
+            fp8_type = aiter.dtypes.fp8
+            fp8_max = torch.finfo(fp8_type).max
+            v_scale = v_bshd.abs().amax(dim=1).to(torch.float32) / fp8_max          # [b, h, d]
+            vq = (v_bshd / v_scale.unsqueeze(1)).to(fp8_type)
+        softmax_scale = (qq.shape[-1] * 2) ** -0.5
+        out_bshd = flash_attn_mxfp4_pertensor_func(
+            qq, kq, vq.contiguous(),
+            qd, kd, v_scale.contiguous(),
+            softmax_scale=float(softmax_scale),
+        )
+        return torch.permute(out_bshd, [0, 2, 1, 3]), None
+
     q_bshd = torch.permute(query, [0, 2, 1, 3]).contiguous()
     k_bshd = torch.permute(key,   [0, 2, 1, 3]).contiguous()
     v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
