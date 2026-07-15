@@ -210,9 +210,7 @@ def _mxfp4_comms_input_all_to_all(query, key, value):
     # per-channel amax) -> purely local, no all-reduce, half the bf16 bytes.
     v_fp8 = value.to(aiter.dtypes.fp8)
 
-    q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(
-        query,
-        key,
+    quant_kwargs = dict(
         BLOCK_SIZE_M=_AITER_SPARGE_ASM_BLOCK_M,
         hadamard_rotation=True,
         R=R,
@@ -222,23 +220,78 @@ def _mxfp4_comms_input_all_to_all(query, key, value):
         sm_scale=sm_scale,
     )
 
-    # Ship fp4 payloads + E8M0 scales. Default: unpacked (each its own a2a) --
-    # simplest, and packing is a wash here (the a2a is bandwidth-bound, and the
-    # mxfp4 kernel needs contiguous q/scale, forcing an unavoidable unpack copy).
-    # Set MXFP4_COMMS_PACK=1 to cat fp4+scale into one a2a per Q/K (A/B only).
+    # Ship fp4 payloads + E8M0 scales. In both paths we issue V (largest, fp8)
+    # FIRST so its all-to-all overlaps the Q/K quant below on the comm stream and
+    # the *exposed* (last-issued) collective is the smaller fp4 Q/K, not the fp8 V.
+    #   MXFP4_COMMS_PACK=1 -> pack fp4+scale into one collective per Q/K.
+    #   else -> unpacked (each fp4/scale its own collective).
     if os.environ.get("MXFP4_COMMS_PACK", "0") != "0":
+        value = _ft_c_input_all_to_all(v_fp8)
+        q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(query, key, **quant_kwargs)
         query = _ft_c_input_all_to_all(torch.cat([q_fp4, q_scale], dim=-1))
         key = _ft_c_input_all_to_all(torch.cat([k_fp4, k_scale], dim=-1))
-        value = _ft_c_input_all_to_all(v_fp8)
         attn_kwargs_update = {"mxfp4_pre_quantized": True, "mxfp4_fp4_width": q_fp4.shape[-1]}
     else:
+        value = _ft_c_input_all_to_all(v_fp8)
+        q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(query, key, **quant_kwargs)
         query = _ft_c_input_all_to_all(q_fp4)
         q_scale = _ft_c_input_all_to_all(q_scale)
         key = _ft_c_input_all_to_all(k_fp4)
         k_scale = _ft_c_input_all_to_all(k_scale)
-        value = _ft_c_input_all_to_all(v_fp8)
         attn_kwargs_update = {"mxfp4_pre_quantized": True, "q_scale": q_scale, "k_scale": k_scale}
     return query, key, value, attn_kwargs_update
+
+
+# DistriFusion-style temporal stale-KV cache for the mxfp4-comms Ulysses path.
+# Keyed by (layer, CFG parity); holds the previous same-branch step's *gathered*
+# (post-a2a) K/V so a later step can attend against slightly-stale K/V while its
+# own fresh K/V is (eventually) gathered in the background. Consecutive denoising
+# steps are highly similar (input temporal redundancy), so reuse is ~lossless.
+_MXFP4_STALE_KV_CACHE: dict = {}
+
+
+def _mxfp4_stale_kv_swap(layer, key, value, mxfp4_kwargs):
+    """DistriFusion-style fresh-local + stale-remote K/V for the mxfp4-comms path.
+
+    Assembles attention K/V as: this rank's own (fresh) sequence block + the
+    previous same-CFG-branch step's (stale) K/V for every other block, then runs
+    one *normal* full-attention call (no LSE merge needed). The fresh local block
+    anchors the current step, avoiding the compounding drift that fully-stale K/V
+    produced (which was pure noise). Probe form: still gathers fresh (blocking)
+    and caches it for the next same-parity step.
+    """
+    import os
+    from xfuser.core.distributed import (
+        get_ulysses_parallel_world_size,
+        get_ulysses_parallel_rank,
+    )
+    rs = get_runtime_state()
+    sc = getattr(rs, "step_counter", None)
+    if sc is None:
+        return key, value, mxfp4_kwargs
+    step = int(sc)
+    warmup_fwd = 2 * int(os.environ.get("MXFP4_COMMS_STALE_WARMUP", "4"))
+    ck = (id(layer), step % 2)  # parity ~ cond/uncond CFG branch
+    kscale = mxfp4_kwargs.get("k_scale")
+    prev = _MXFP4_STALE_KV_CACHE.get(ck)
+    _MXFP4_STALE_KV_CACHE[ck] = (key, value, kscale)  # fresh full gather -> next step
+    if prev is None or step < warmup_fwd:
+        return key, value, mxfp4_kwargs
+    P = get_ulysses_parallel_world_size()
+    r = get_ulysses_parallel_rank()
+    S = key.shape[2]  # gathered layout [B, H/P, S_full, D]
+    if P <= 1 or S % P != 0:
+        return key, value, mxfp4_kwargs
+    s = S // P
+    lo, hi = r * s, (r + 1) * s  # this rank's own (fresh) sequence block
+    sk, sv, sks = prev
+    k_used = sk.clone(); k_used[:, :, lo:hi, :] = key[:, :, lo:hi, :]
+    v_used = sv.clone(); v_used[:, :, lo:hi, :] = value[:, :, lo:hi, :]
+    nk = dict(mxfp4_kwargs)
+    if kscale is not None and sks is not None:
+        ks_used = sks.clone(); ks_used[:, :, lo:hi, :] = kscale[:, :, lo:hi, :]
+        nk["k_scale"] = ks_used
+    return k_used, v_used, nk
 
 
 def _fp8_comms_output_all_to_all(out: torch.Tensor, o_scale_t: torch.Tensor | None) -> torch.Tensor:
@@ -249,6 +302,22 @@ def _fp8_comms_output_all_to_all(out: torch.Tensor, o_scale_t: torch.Tensor | No
     else:
         out_fp8, out_descale = out, o_scale_t
     return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(restore_dtype)
+
+
+def _mxfp4_comms_output_all_to_all(out: torch.Tensor) -> torch.Tensor:
+    """Naive-fp8 output all-to-all for the mxfp4-comms path.
+
+    Casts the attention output to fp8 (descale=1) before the output gather,
+    halving the bf16 payload. Safe because out = softmax(QK)*V is a convex
+    combination of V, so |out| <= max|V|, and V is already shipped as naive fp8;
+    descale=1 is identical on every rank, so the post-a2a tensor (which mixes
+    fp8 chunks from all ranks) needs no per-rank rescale.
+    """
+    import aiter
+    restore_dtype = out.dtype if out.dtype not in _FP8_DTYPES else torch.bfloat16
+    out_fp8 = out.to(aiter.dtypes.fp8)
+    out_fp8 = _ft_c_output_all_to_all(out_fp8)
+    return out_fp8.to(restore_dtype)
 
 
 def _combined_qkv_all_to_all(q, k, v):
@@ -477,6 +546,8 @@ def USP(
             and getattr(hb_backend, "name", None) == "AITER_MXFP4"
         ):
             query, key, value, mxfp4_kwargs = _mxfp4_comms_input_all_to_all(query, key, value)
+            if os.environ.get("MXFP4_COMMS_STALE_KV", "0") != "0" and head_balance_layer is not None:
+                key, value, mxfp4_kwargs = _mxfp4_stale_kv_swap(head_balance_layer, key, value, mxfp4_kwargs)
             attention_kwargs = (attention_kwargs or {}) | mxfp4_kwargs
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
@@ -538,6 +609,12 @@ def USP(
                     "FP8 comms requires per-layer scale buffers fp8_o_scale"
                 )
             out = _fp8_comms_output_all_to_all(out, fp8_o_scale)
+        elif (
+            get_runtime_state().runtime_config.use_mxfp4_comms
+            and getattr(hb_backend, "name", None) == "AITER_MXFP4"
+            and os.environ.get("MXFP4_COMMS_FP8_OUT", "1") != "0"
+        ):
+            out = _mxfp4_comms_output_all_to_all(out)
         else:
             out = _ft_c_output_all_to_all(out)
         if hb_applied:
