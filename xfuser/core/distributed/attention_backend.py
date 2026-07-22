@@ -826,12 +826,18 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
             kd = torch.permute(attention_kwargs["k_scale"], [0, 2, 1, 3]).contiguous()
         v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()                    # [b, s, h, d]
         if v_bshd.dtype in _FP8_INPUT_DTYPES:
-            # V arrived naively fp8-cast (descale = 1) from mxfp4-comms: use directly.
             vq = v_bshd
-            v_scale = torch.ones(
-                v_bshd.shape[0], v_bshd.shape[2], v_bshd.shape[3],
-                device=v_bshd.device, dtype=torch.float32,
-            )                                                                       # [b, h, d]
+            v_desc = attention_kwargs.get("mxfp4_v_descale")
+            if v_desc is not None:
+                # V was pre-quantized to fp8 with a proper per-channel amax descale
+                # (computed post-a2a in usp, overlapping the exposed K a2a).
+                v_scale = v_desc.to(torch.float32)                                  # [b, h, d]
+            else:
+                # V arrived naively fp8-cast (descale = 1) from mxfp4-comms.
+                v_scale = torch.ones(
+                    v_bshd.shape[0], v_bshd.shape[2], v_bshd.shape[3],
+                    device=v_bshd.device, dtype=torch.float32,
+                )                                                                   # [b, h, d]
         else:
             # V still bf16 (e.g. mxfp4-comms disabled): per-channel amax over the
             # now-complete post-a2a sequence, matching sage_quant's V path.

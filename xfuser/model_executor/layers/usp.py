@@ -226,19 +226,43 @@ def _mxfp4_comms_input_all_to_all(query, key, value):
     #   MXFP4_COMMS_PACK=1 -> pack fp4+scale into one collective per Q/K.
     #   else -> unpacked (each fp4/scale its own collective).
     if os.environ.get("MXFP4_COMMS_PACK", "0") != "0":
-        value = _ft_c_input_all_to_all(v_fp8)
+        v_bf16_comms = os.environ.get("MXFP4_COMMS_V_BF16", "0") != "0"
+        value = _ft_c_input_all_to_all(value if v_bf16_comms else v_fp8)
         q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(query, key, **quant_kwargs)
         query = _ft_c_input_all_to_all(torch.cat([q_fp4, q_scale], dim=-1))
-        key = _ft_c_input_all_to_all(torch.cat([k_fp4, k_scale], dim=-1))
+        key = _ft_c_input_all_to_all(torch.cat([k_fp4, k_scale], dim=-1))  # packed K last
         attn_kwargs_update = {"mxfp4_pre_quantized": True, "mxfp4_fp4_width": q_fp4.shape[-1]}
+        if v_bf16_comms:
+            # proper per-channel fp8 V quant post-gather; overlaps the packed-K a2a.
+            fp8_dtype = aiter.dtypes.fp8
+            v_descale = (
+                value.abs().amax(dim=2, keepdim=True).clamp(min=1e-8)
+                / torch.finfo(fp8_dtype).max
+            )
+            value = (value / v_descale).to(fp8_dtype)
+            attn_kwargs_update["mxfp4_v_descale"] = v_descale.squeeze(2)
     else:
-        value = _ft_c_input_all_to_all(v_fp8)
+        # MXFP4_COMMS_V_BF16=1: ship V as bf16 (its a2a still finishes well before
+        # the exposed K tail) and defer a *proper* per-channel-amax fp8 quant to
+        # after the gather. That quant runs during the exposed K all-to-all (fills
+        # the bubble ~for free) and avoids the naive descale=1 cast clipping any
+        # |V| > 448 (fp8 e4m3 max), so V is more accurate at ~no latency cost.
+        v_bf16_comms = os.environ.get("MXFP4_COMMS_V_BF16", "0") != "0"
+        value = _ft_c_input_all_to_all(value if v_bf16_comms else v_fp8)
         q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(query, key, **quant_kwargs)
         query = _ft_c_input_all_to_all(q_fp4)
         q_scale = _ft_c_input_all_to_all(q_scale)
         key = _ft_c_input_all_to_all(k_fp4)
-        k_scale = _ft_c_input_all_to_all(k_scale)
+        k_scale = _ft_c_input_all_to_all(k_scale)  # exposed tail; V quant below overlaps it
         attn_kwargs_update = {"mxfp4_pre_quantized": True, "q_scale": q_scale, "k_scale": k_scale}
+        if v_bf16_comms:
+            fp8_dtype = aiter.dtypes.fp8
+            v_descale = (
+                value.abs().amax(dim=2, keepdim=True).clamp(min=1e-8)
+                / torch.finfo(fp8_dtype).max
+            )  # [b, h/P, 1, d] per-channel over the full post-a2a sequence
+            value = (value / v_descale).to(fp8_dtype)
+            attn_kwargs_update["mxfp4_v_descale"] = v_descale.squeeze(2)  # [b, h/P, d]
     return query, key, value, attn_kwargs_update
 
 
