@@ -1,4 +1,5 @@
 import functools
+import os
 import torch
 import inspect
 import math
@@ -377,7 +378,13 @@ if env_info["has_aiter"]:
         pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_V2 is not available.
     try:
         from aiter.ops.mha import flash_attn_mxfp4_pertensor_func
-        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+        from aiter.ops.mha import flash_attn_f4f4_pertensor_func
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+            sage_quant_mxfp4,
+            sage_quant_f4f4,
+            _pack_v_fp4_colmajor,
+            _pack_v_fp8_perchannel,
+        )
         from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import (
             sage_quant_mxfp4_fp8_input,
         )
@@ -469,6 +476,7 @@ class AttentionBackendType(Enum):
     AITER_FP8 = "AITER FP8"
     AITER_I8FP8 = "AITER i8fp8 ASM"
     AITER_MXFP4 = "AITER mxfp4 ASM"
+    AITER_F4F4 = "AITER f4f4 ASM"
     AITER_MLA = "AITER MLA"
     AITER_SAGE = "AITER Sage"
     AITER_SPARSE_SAGE = "AITER Sparse Sage"
@@ -491,6 +499,7 @@ SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
     AttentionBackendType.AITER_FP8,
     AttentionBackendType.AITER_SAGE_V2,
     AttentionBackendType.AITER_MXFP4,
+    AttentionBackendType.AITER_F4F4,
     AttentionBackendType.AITER_SPARGE_ASM_FP8,
     AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
     AttentionBackendType.AITER_SPARGE_ASM_V2,
@@ -801,53 +810,136 @@ def _aiter_i8fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kw
     return torch.permute(out_bshd, [0, 2, 1, 3]), None
 
 
+# ---------------------------------------------------------------------------
+# f4f4 (fp4 Q/K + per-channel fp4 V) support. V is packed with the shared in-tree aiter
+# quantizer: sage_quant_f4f4 for the fresh path, and its V half _pack_v_fp4_colmajor
+# (imported above) for the mxfp4-comms path where Q/K arrive already fp4-packed. No
+# external host-packer dep and no local V-quant kernel caller.
+# ---------------------------------------------------------------------------
+def _mxfp4_comms_unpack_qk(query, key, attention_kwargs):
+    """Recover bshd mxfp4 Q/K (fp4 payload + E8M0 block scales) that arrived over the
+    mxfp4-comms all-to-all. Shared by the AITER_MXFP4 and AITER_F4F4 callers (both
+    consume identical fp4 Q/K; they differ only in how V is quantized).
+
+    Returns (qq, qd, kq, kd): bshd [b, s, h, d/2] fp4 payloads + [b, s, h, d/32] scales.
+    """
+    if "mxfp4_fp4_width" in attention_kwargs:
+        # packed: [fp4 payload | E8M0 scales] on the last dim; split apart.
+        w = attention_kwargs["mxfp4_fp4_width"]
+        q_bshd = torch.permute(query, [0, 2, 1, 3])                                  # [b, s, h, d/2 + d/32]
+        k_bshd = torch.permute(key,   [0, 2, 1, 3])
+        qq = q_bshd[..., :w].contiguous()                                           # [b, s, h, d/2] uint8
+        qd = q_bshd[..., w:].contiguous()                                           # [b, s, h, d/32]
+        kq = k_bshd[..., :w].contiguous()
+        kd = k_bshd[..., w:].contiguous()
+    else:
+        # unpacked: fp4 payloads and E8M0 scales arrived as separate tensors.
+        qq = torch.permute(query, [0, 2, 1, 3]).contiguous()                        # [b, s, h, d/2] uint8
+        kq = torch.permute(key,   [0, 2, 1, 3]).contiguous()
+        qd = torch.permute(attention_kwargs["q_scale"], [0, 2, 1, 3]).contiguous()  # [b, s, h, d/32]
+        kd = torch.permute(attention_kwargs["k_scale"], [0, 2, 1, 3]).contiguous()
+    return qq, qd, kq, kd
+
+
+def _f4f4_pad_bshd_seq(t, s_pad):
+    """Zero-pad a bshd tensor [b, s, h, d] along the sequence dim up to s_pad. The pad
+    amount is a compile-time constant for a fixed resolution (seqlen is identical across
+    denoising steps), so the torch.cat is a static-shape op -- graph-safe under Wan's
+    ``mode="default"`` compile (no CUDA-graph capture, no per-step recompile)."""
+    s = t.shape[1]
+    if s == s_pad:
+        return t.contiguous()
+    z = t.new_zeros(t.shape[0], s_pad - s, t.shape[2], t.shape[3])
+    return torch.cat([t, z], dim=1).contiguous()
+
+
+@register_attention_function(AttentionBackendType.AITER_F4F4)
+def _aiter_f4f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """f4f4 backend: mxfp4 Q/K + per-channel fp4 (E2M1) V (fwd_hd128_f4f4.co).
+
+    * mxfp4-comms (mxfp4_pre_quantized): Q/K arrive already fp4-packed -> unpack them
+      (shared helper); V is already packed to per-channel fp4 in usp (its descale comes
+      via attention_kwargs), so just dispatch.
+    * fresh: a single in-tree sage_quant_f4f4 pass quantizes Q/K to mxfp4 and packs V
+      to per-channel fp4 (mirrors bench_sage.py::make_f4f4_runner).
+
+    The f4f4 kernel only supports a KV length that is a multiple of 128 (unlike mxfp4,
+    it does not mask a partial last KV tile -> NaNs on ragged lengths). Video sequences
+    are rarely a multiple of 128, so we pad only K/V up to the next multiple of 128 (Q is
+    tiled/bounded independently, so it stays ragged -> the output already has the true
+    query length, no slice). Keeping seqlen_k a multiple of 128 makes the kernel take its
+    no-mask path; the zero-padded keys carry V=0 and only dilute the softmax denominator
+    by <=127/seqlen, i.e. negligibly (verified bit-identical to padding Q as well)."""
+    attention_kwargs = attention_kwargs or {}
+
+    if attention_kwargs.get("mxfp4_pre_quantized", False):
+        qq, qd, kq, kd = _mxfp4_comms_unpack_qk(query, key, attention_kwargs)  # bshd, true s
+        # V was packed to per-channel fp4 in usp; the view is already 128-padded
+        # (bshd [b, kv_pad, h, 128]); pass it straight through (never .contiguous()).
+        v_fp4 = value
+        v_descale = attention_kwargs["mxfp4_v_descale"]
+        # Pad only K to V's 128-rounded length so seqlen_k is a multiple of 128 (no-mask
+        # kernel path). Q stays ragged -> output is the true query length (no pad, no slice).
+        s_pad = v_fp4.shape[1]                          # kv_pad (multiple of 128)
+        kq = _f4f4_pad_bshd_seq(kq, s_pad)
+        kd = _f4f4_pad_bshd_seq(kd, s_pad)
+        softmax_scale = (qq.shape[-1] * 2) ** -0.5
+        out_bshd = flash_attn_f4f4_pertensor_func(
+            qq, kq, v_fp4,
+            qd, kd, v_descale.to(torch.float32).contiguous(),
+            softmax_scale=float(softmax_scale),
+        )
+        return torch.permute(out_bshd, [0, 2, 1, 3]), None
+
+    q_bshd = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    k_bshd = torch.permute(key,   [0, 2, 1, 3]).contiguous()
+    v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
+    # sage_quant_f4f4 packs V per-channel fp4, which needs kv_len % 128 == 0; pad only K/V.
+    # Q is tiled/bounded independently (quantized separately from K), so it stays ragged and
+    # the output keeps the true query length -> no pad on Q, no output slice.
+    s_pad = ((k_bshd.shape[1] + 127) // 128) * 128
+    k_bshd = _f4f4_pad_bshd_seq(k_bshd, s_pad)
+    v_bshd = _f4f4_pad_bshd_seq(v_bshd, s_pad)
+    fp8_type = aiter.dtypes.fp8
+    qq, qd, kq, kd, v_fp4, v_descale, _ = sage_quant_f4f4(
+        q_bshd, k_bshd, v_bshd,
+        fp8_type, torch.finfo(fp8_type).max,
+        BLKQ=_AITER_SPARGE_ASM_BLOCK_M, BLKK=64,
+        layout="bshd",
+        R=HADAMARD_MATRIX[q_bshd.device], BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+        q_smoothing=False,
+    )
+    # v_fp4 is the strided col-major fp4 view from sage_quant_f4f4 -- pass it straight
+    # through (never .contiguous(), which would drop the layout the f4f4 kernel reads).
+    softmax_scale = (qq.shape[-1] * 2) ** -0.5
+    out_bshd = flash_attn_f4f4_pertensor_func(
+        qq.contiguous(), kq.contiguous(), v_fp4,
+        qd.contiguous(), kd.contiguous(), v_descale.to(torch.float32).contiguous(),
+        softmax_scale=float(softmax_scale),
+    )
+    return torch.permute(out_bshd, [0, 2, 1, 3]), None
+
+
 @register_attention_function(AttentionBackendType.AITER_MXFP4)
 def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    """mxfp4 backend: mxfp4 Q/K + fp8 V (fwd_hd128_mxfp4.co).
+
+    * mxfp4-comms (mxfp4_pre_quantized): Q/K arrive already fp4-packed -> unpack them
+      (shared helper); V is already fp8 (per-channel scale for bf16-comm, or a dummy
+      ones scale for naive fp8-comm) with its scale via attention_kwargs -> just dispatch.
+    * fresh: sage_quant_mxfp4 (or its fp8-input variant when Q/K came over fp8-comms).
+    """
     attention_kwargs = attention_kwargs or {}
     pre_quantized = attention_kwargs.get("pre_quantized", False)
 
     if attention_kwargs.get("mxfp4_pre_quantized", False):
-        # Q/K arrive already MXFP4 (fp4 payload + E8M0 block scales) from the
-        # mxfp4-comms all-to-all; skip re-quantizing them. Only V needs handling.
-        if "mxfp4_fp4_width" in attention_kwargs:
-            # packed: [fp4 payload | E8M0 scales] on the last dim; split apart.
-            w = attention_kwargs["mxfp4_fp4_width"]
-            q_bshd = torch.permute(query, [0, 2, 1, 3])                              # [b, s, h, d/2 + d/32]
-            k_bshd = torch.permute(key,   [0, 2, 1, 3])
-            qq = q_bshd[..., :w].contiguous()                                       # [b, s, h, d/2] uint8
-            qd = q_bshd[..., w:].contiguous()                                       # [b, s, h, d/32]
-            kq = k_bshd[..., :w].contiguous()
-            kd = k_bshd[..., w:].contiguous()
-        else:
-            # unpacked: fp4 payloads and E8M0 scales arrived as separate tensors.
-            qq = torch.permute(query, [0, 2, 1, 3]).contiguous()                    # [b, s, h, d/2] uint8
-            kq = torch.permute(key,   [0, 2, 1, 3]).contiguous()
-            qd = torch.permute(attention_kwargs["q_scale"], [0, 2, 1, 3]).contiguous()  # [b, s, h, d/32]
-            kd = torch.permute(attention_kwargs["k_scale"], [0, 2, 1, 3]).contiguous()
-        v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()                    # [b, s, h, d]
-        if v_bshd.dtype in _FP8_INPUT_DTYPES:
-            vq = v_bshd
-            v_desc = attention_kwargs.get("mxfp4_v_descale")
-            if v_desc is not None:
-                # V was pre-quantized to fp8 with a proper per-channel amax descale
-                # (computed post-a2a in usp, overlapping the exposed K a2a).
-                v_scale = v_desc.to(torch.float32)                                  # [b, h, d]
-            else:
-                # V arrived naively fp8-cast (descale = 1) from mxfp4-comms.
-                v_scale = torch.ones(
-                    v_bshd.shape[0], v_bshd.shape[2], v_bshd.shape[3],
-                    device=v_bshd.device, dtype=torch.float32,
-                )                                                                   # [b, h, d]
-        else:
-            # V still bf16 (e.g. mxfp4-comms disabled): per-channel amax over the
-            # now-complete post-a2a sequence, matching sage_quant's V path.
-            fp8_type = aiter.dtypes.fp8
-            fp8_max = torch.finfo(fp8_type).max
-            v_scale = v_bshd.abs().amax(dim=1).to(torch.float32) / fp8_max          # [b, h, d]
-            vq = (v_bshd / v_scale.unsqueeze(1)).to(fp8_type)
+        qq, qd, kq, kd = _mxfp4_comms_unpack_qk(query, key, attention_kwargs)
+        # V was quantized to fp8 in usp (bhsd); scale via kwargs.
+        vq = torch.permute(value, [0, 2, 1, 3]).contiguous()                        # [b, s, h, d] fp8
+        v_scale = attention_kwargs["mxfp4_v_scale"]                                 # [b, h, d]
         softmax_scale = (qq.shape[-1] * 2) ** -0.5
         out_bshd = flash_attn_mxfp4_pertensor_func(
-            qq, kq, vq.contiguous(),
+            qq, kq, vq,
             qd, kd, v_scale.contiguous(),
             softmax_scale=float(softmax_scale),
         )

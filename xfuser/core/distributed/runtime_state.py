@@ -257,7 +257,7 @@ class RuntimeState(metaclass=ABCMeta):
         self._check_if_backend_compatible_with_current_configuration(attention_backend)
         self.attention_backend = attention_backend
         logger.warning("Using {} as attention backend.".format(self.attention_backend.name))
-        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.AITER_MLA, AttentionBackendType.AITER_MXFP4]:
+        if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.AITER_MLA, AttentionBackendType.AITER_MXFP4, AttentionBackendType.AITER_F4F4]:
             logger.warning("Low-precision attention backend is enabled. This may cause poor quality outputs, consider using hybrid attention if possible.")
 
 
@@ -448,6 +448,7 @@ class RuntimeState(metaclass=ABCMeta):
                                  AttentionBackendType.AITER_SPARGE_V2,
                                  AttentionBackendType.AITER_I8FP8,
                                  AttentionBackendType.AITER_MXFP4,
+                                 AttentionBackendType.AITER_F4F4,
                                  AttentionBackendType.AITER_FLYDSL,
                                  AttentionBackendType.FLEX_BLOCK_ATTN,
                                  AttentionBackendType.FLEX_BLOCK_SPARGE]:
@@ -623,6 +624,23 @@ class RuntimeState(metaclass=ABCMeta):
                     "aiter.ops.triton.quant.sage_attention_quant_wrappers.sage_quant_mxfp4, "
                     "and aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper."
                     "sage_quant_mxfp4_fp8_input for fp8-comms input."
+                ) from None
+        elif attention_backend == AttentionBackendType.AITER_F4F4:
+            try:
+                from aiter.ops.mha import flash_attn_f4f4_pertensor_func
+                from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+                    sage_quant_f4f4,
+                    _pack_v_fp4_colmajor,
+                )
+            except ImportError:
+                raise RuntimeError(
+                    "AITER f4f4 ASM attention is not available; this backend needs "
+                    "the f4f4 gfx950 .co (fwd_hd128_f4f4.co) via its dedicated launch "
+                    "path aiter.ops.mha.flash_attn_f4f4_pertensor_func (the compile-op "
+                    "fmha_v3_fwd_f4f4; no AITER_FMHA_F4F4 env var) and the in-tree fp4 "
+                    "quantizer aiter.ops.triton.quant.sage_attention_quant_wrappers."
+                    "sage_quant_f4f4 (plus its shared V packer _pack_v_fp4_colmajor "
+                    "for the mxfp4-comms path)."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
             msg = "AITER Sparge attention is not available, please update AITER"

@@ -54,6 +54,10 @@ _ATTENTION_BACKENDS_SUPPORTING_PRE_HADAMARD_ROTATION = frozenset({
     AttentionBackendType.AITER_SPARGE_ASM_FP8,
     AttentionBackendType.AITER_SPARGE_ASM_FP8_AFFINE_SORTED,
 })
+# Attention backends whose Ulysses all-to-all can ship MXFP4 (fp4) payloads.
+# Both route through _aiter_mxfp4_attn_call's mxfp4_pre_quantized path; AITER_F4F4
+# additionally repacks V to per-channel fp4 in the kernel call.
+_MXFP4_COMMS_BACKENDS = frozenset({"AITER_MXFP4", "AITER_F4F4"})
 _FP8_LOG_SCALES = bool(os.environ.get("XFUSER_FP8_LOG_SCALES"))
 _FP8_NCCL_NEEDS_VIEW = parse(torch.__version__).release < parse("2.11.0").release
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
@@ -168,7 +172,7 @@ def _fp8_comms_input_all_to_all(
     return query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes
 
 
-def _mxfp4_comms_input_all_to_all(query, key, value):
+def _mxfp4_comms_input_all_to_all(query, key, value, is_f4f4=False):
     """MXFP4 (fp4) Ulysses input all-to-all for the AITER_MXFP4 attention path.
 
     Quantizes Q/K to mxfp4 *before* the all-to-all and ships the packed fp4
@@ -192,6 +196,8 @@ def _mxfp4_comms_input_all_to_all(query, key, value):
         HADAMARD_MATRIX,
         AITER_SAGE_V2_BLOCK_R,
         _AITER_SPARGE_ASM_BLOCK_M,
+        _pack_v_fp4_colmajor,
+        _pack_v_fp8_perchannel,
     )
     from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
         smooth_rotate_downcast_qk,
@@ -208,7 +214,6 @@ def _mxfp4_comms_input_all_to_all(query, key, value):
     # V: naive direct fp8 cast (descale = 1). fp8 is floating-point, so its
     # exponent already spans V's range (validated: identical cosine to a
     # per-channel amax) -> purely local, no all-reduce, half the bf16 bytes.
-    v_fp8 = value.to(aiter.dtypes.fp8)
 
     quant_kwargs = dict(
         BLOCK_SIZE_M=_AITER_SPARGE_ASM_BLOCK_M,
@@ -220,49 +225,61 @@ def _mxfp4_comms_input_all_to_all(query, key, value):
         sm_scale=sm_scale,
     )
 
-    # Ship fp4 payloads + E8M0 scales. In both paths we issue V (largest, fp8)
-    # FIRST so its all-to-all overlaps the Q/K quant below on the comm stream and
-    # the *exposed* (last-issued) collective is the smaller fp4 Q/K, not the fp8 V.
-    #   MXFP4_COMMS_PACK=1 -> pack fp4+scale into one collective per Q/K.
-    #   else -> unpacked (each fp4/scale its own collective).
+    # V a2a. MXFP4_COMMS_V_BF16 selects the V wire format for BOTH mxfp4 and f4f4:
+    #   set  -> ship bf16, then quantize post-gather (per-channel fp8 for mxfp4,
+    #           per-channel fp4 for f4f4) -- most accurate.
+    #   unset-> ship naive fp8 (half the bytes): mxfp4 consumes fp8 directly with a
+    #           descale=1 dummy scale; f4f4 upcasts fp8->bf16 before its fp4 repack
+    #           (a lossy fp8 roundtrip, but the smaller V transfer can win).
+    # Either way V is issued FIRST so its a2a overlaps the Q/K quant + the exposed
+    # Q/K collective below.
+    v_bf16_comms = os.environ.get("MXFP4_COMMS_V_BF16", "0") != "0"
+    ship_v_bf16 = v_bf16_comms
+    value = _ft_c_input_all_to_all(value if ship_v_bf16 else value.to(aiter.dtypes.fp8))
+
+    # q, k quant
+    q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(query, key, **quant_kwargs)
+
+    # MXFP4_COMMS_PACK=1 -> pack fp4+scale into one collective per Q/K.
+    # else -> unpacked (each fp4/scale its own collective).
     if os.environ.get("MXFP4_COMMS_PACK", "0") != "0":
-        v_bf16_comms = os.environ.get("MXFP4_COMMS_V_BF16", "0") != "0"
-        value = _ft_c_input_all_to_all(value if v_bf16_comms else v_fp8)
-        q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(query, key, **quant_kwargs)
         query = _ft_c_input_all_to_all(torch.cat([q_fp4, q_scale], dim=-1))
         key = _ft_c_input_all_to_all(torch.cat([k_fp4, k_scale], dim=-1))  # packed K last
         attn_kwargs_update = {"mxfp4_pre_quantized": True, "mxfp4_fp4_width": q_fp4.shape[-1]}
-        if v_bf16_comms:
-            # proper per-channel fp8 V quant post-gather; overlaps the packed-K a2a.
-            fp8_dtype = aiter.dtypes.fp8
-            v_descale = (
-                value.abs().amax(dim=2, keepdim=True).clamp(min=1e-8)
-                / torch.finfo(fp8_dtype).max
-            )
-            value = (value / v_descale).to(fp8_dtype)
-            attn_kwargs_update["mxfp4_v_descale"] = v_descale.squeeze(2)
     else:
-        # MXFP4_COMMS_V_BF16=1: ship V as bf16 (its a2a still finishes well before
-        # the exposed K tail) and defer a *proper* per-channel-amax fp8 quant to
-        # after the gather. That quant runs during the exposed K all-to-all (fills
-        # the bubble ~for free) and avoids the naive descale=1 cast clipping any
-        # |V| > 448 (fp8 e4m3 max), so V is more accurate at ~no latency cost.
-        v_bf16_comms = os.environ.get("MXFP4_COMMS_V_BF16", "0") != "0"
-        value = _ft_c_input_all_to_all(value if v_bf16_comms else v_fp8)
-        q_fp4, q_scale, k_fp4, k_scale, _ = smooth_rotate_downcast_qk(query, key, **quant_kwargs)
         query = _ft_c_input_all_to_all(q_fp4)
         q_scale = _ft_c_input_all_to_all(q_scale)
         key = _ft_c_input_all_to_all(k_fp4)
-        k_scale = _ft_c_input_all_to_all(k_scale)  # exposed tail; V quant below overlaps it
+        k_scale = _ft_c_input_all_to_all(k_scale)  # exposed tail
         attn_kwargs_update = {"mxfp4_pre_quantized": True, "q_scale": q_scale, "k_scale": k_scale}
+
+    # --- V quant at the tail. The quant kernels launch on the compute stream while
+    # the (still-unwaited) Q/K + k_scale collective is in flight on the comm stream,
+    # so V quantization overlaps the exposed K a2a. V's per-channel scale is an amax
+    # over the *full* (post-a2a) sequence, so it must be computed here post-gather.
+    # Both backends branch identically on the V wire format (v_bf16_comms).
+    if is_f4f4:
+        # f4f4: per-channel fp4 (E2M1) V. The packer reads strides (no .contiguous())
+        # and packs from bf16 directly (no fp32 upcast); it returns a 128-padded view.
         if v_bf16_comms:
-            fp8_dtype = aiter.dtypes.fp8
-            v_descale = (
-                value.abs().amax(dim=2, keepdim=True).clamp(min=1e-8)
-                / torch.finfo(fp8_dtype).max
-            )  # [b, h/P, 1, d] per-channel over the full post-a2a sequence
-            value = (value / v_descale).to(fp8_dtype)
-            attn_kwargs_update["mxfp4_v_descale"] = v_descale.squeeze(2)  # [b, h/P, d]
+            v_bshd = torch.permute(value, [0, 2, 1, 3])                     # bf16 [b, s, h, d]
+        else:
+            # naive fp8 comm -> upcast fp8->bf16 for the fp4 repack.
+            v_bshd = torch.permute(value, [0, 2, 1, 3]).to(torch.bfloat16)  # [b, s, h, d]
+        value, v_descale = _pack_v_fp4_colmajor(v_bshd)                     # bshd fp4 view (128-padded)
+        attn_kwargs_update["mxfp4_v_descale"] = v_descale
+    else:
+        # mxfp4: per-channel fp8 V.
+        if v_bf16_comms:
+            # per-channel amax fp8 quant over the full gathered sequence (bhsd in/out).
+            value, v_scale = _pack_v_fp8_perchannel(value)                 # bhsd fp8
+        else:
+            # naive fp8 comm (descale = 1): dummy per-channel ones scale (bhsd: h = dim 1).
+            v_scale = torch.ones(
+                value.shape[0], value.shape[1], value.shape[3],
+                device=value.device, dtype=torch.float32,
+            )                                                              # [b, h, d]
+        attn_kwargs_update["mxfp4_v_scale"] = v_scale
     return query, key, value, attn_kwargs_update
 
 
@@ -567,9 +584,14 @@ def USP(
             attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
         elif (
             get_runtime_state().runtime_config.use_mxfp4_comms
-            and getattr(hb_backend, "name", None) == "AITER_MXFP4"
+            and getattr(hb_backend, "name", None) in _MXFP4_COMMS_BACKENDS
         ):
-            query, key, value, mxfp4_kwargs = _mxfp4_comms_input_all_to_all(query, key, value)
+            # Shared mxfp4 Q/K comms packing for both AITER_MXFP4 and AITER_F4F4; V is
+            # quantized here too (per its backend's V path) so it overlaps the K a2a.
+            is_f4f4 = getattr(hb_backend, "name", None) == "AITER_F4F4"
+            query, key, value, mxfp4_kwargs = _mxfp4_comms_input_all_to_all(
+                query, key, value, is_f4f4=is_f4f4,
+            )
             if os.environ.get("MXFP4_COMMS_STALE_KV", "0") != "0" and head_balance_layer is not None:
                 key, value, mxfp4_kwargs = _mxfp4_stale_kv_swap(head_balance_layer, key, value, mxfp4_kwargs)
             attention_kwargs = (attention_kwargs or {}) | mxfp4_kwargs
@@ -635,7 +657,7 @@ def USP(
             out = _fp8_comms_output_all_to_all(out, fp8_o_scale)
         elif (
             get_runtime_state().runtime_config.use_mxfp4_comms
-            and getattr(hb_backend, "name", None) == "AITER_MXFP4"
+            and getattr(hb_backend, "name", None) in _MXFP4_COMMS_BACKENDS
             and os.environ.get("MXFP4_COMMS_FP8_OUT", "1") != "0"
         ):
             out = _mxfp4_comms_output_all_to_all(out)
