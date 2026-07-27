@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import math
@@ -8,6 +9,66 @@ except ImportError:
     pass # Error will be thrown in base_model.py, if mxfp4 gemms are enabled but AITER is not available.
 from typing import Optional
 from xfuser.core.distributed.runtime_state import get_runtime_state
+
+
+# ---------------------------------------------------------------------------
+# Hadamard (QuaRot/SpinQuant-style) incoherence preprocessing for MXFP4 GEMMs.
+#
+# For Y = X @ W.T, insert a block-diagonal orthonormal rotation R on the shared
+# in_features axis:  Y = (X @ R) @ (W @ R).T, which is *exact* in real arithmetic
+# because each block satisfies R @ R.T == I. Rotating spreads per-channel
+# outliers across each block, shrinking the per-32 block amax that MXFP4's shared
+# E8M0 scale must cover -> markedly lower fp4 quant error at equal bit-width.
+#
+# The weight rotation is folded in offline (once, at quantize time -> free at
+# runtime); only the activation rotation runs online, and it is cheap
+# (~block_r/N of the GEMM's flops).
+# ---------------------------------------------------------------------------
+_MXFP4_HADAMARD_ENABLED = os.environ.get("XFUSER_MXFP4_GEMM_HADAMARD", "0") != "0"
+try:
+    _MXFP4_HADAMARD_BLOCK_R = int(os.environ.get("XFUSER_MXFP4_GEMM_HADAMARD_BLOCK_R", "32"))
+except ValueError:
+    _MXFP4_HADAMARD_BLOCK_R = 32
+
+_HADAMARD_CACHE: dict = {}
+
+
+def _build_hadamard(block_r: int, dtype=torch.bfloat16) -> torch.Tensor:
+    """Normalized Hadamard matrix R (block_r x block_r, R @ R.T == I, block_r a
+    power of two). Prefers aiter's create_hadamard_matrix; falls back to a local
+    Sylvester construction so the rotation also works without that kernel."""
+    try:
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+            create_hadamard_matrix,
+        )
+        return (create_hadamard_matrix(block_r, dtype=dtype) / (block_r ** 0.5)).to(dtype)
+    except Exception:
+        assert block_r > 0 and (block_r & (block_r - 1)) == 0, "block_r must be a power of 2"
+        H = torch.ones((1, 1), dtype=torch.float32)
+        while H.shape[0] < block_r:
+            H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+        return (H / (block_r ** 0.5)).to(dtype)
+
+
+def _get_hadamard(block_r: int, device, dtype=torch.bfloat16) -> torch.Tensor:
+    key = (str(device), block_r, dtype)
+    R = _HADAMARD_CACHE.get(key)
+    if R is None:
+        R = _build_hadamard(block_r, dtype).to(device)
+        _HADAMARD_CACHE[key] = R
+    return R
+
+
+def _hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+    """Block-diagonal orthonormal rotation along the last (in_features) axis, in
+    contiguous blocks of R.shape[-1]. Applied identically to weights (offline)
+    and activations (online) so the GEMM output is unchanged up to quant error."""
+    d = x.shape[-1]
+    br = R.shape[-1]
+    R = R.to(x.dtype)
+    if br == d:
+        return torch.matmul(x, R)
+    return torch.matmul(x.unflatten(-1, (d // br, br)), R).flatten(-2)
 
 
 @torch.library.custom_op("mylib::mxfp4_gemm", mutates_args=())
@@ -40,7 +101,19 @@ class xFuserMXFP4Linear(nn.Module):
         
         self.in_features = in_features
         self.out_features = out_features
-        
+
+        # Hadamard incoherence rotation (0 => disabled). Requires block_r | in_features
+        # so the block-diagonal rotation tiles the contraction axis exactly.
+        self._hadamard_block_r = (
+            _MXFP4_HADAMARD_BLOCK_R
+            if (_MXFP4_HADAMARD_ENABLED and _MXFP4_HADAMARD_BLOCK_R > 0
+                and in_features % _MXFP4_HADAMARD_BLOCK_R == 0)
+            else 0
+        )
+        # Buffer slot for the (device-resident) rotation matrix; filled at quantize
+        # time. persistent=False: it is a derived constant, not part of the checkpoint.
+        self.register_buffer("_hadamard_R", None, persistent=False)
+
         self.weight = nn.Parameter(
             torch.empty((out_features, in_features), **factory_kwargs)
         )
@@ -101,8 +174,16 @@ class xFuserMXFP4Linear(nn.Module):
                 "Call load_and_quantize_weights() or reset_parameters() first."
             )
         
+        # Fold the Hadamard rotation into the weights offline (free at runtime).
+        # The activation must be rotated by the same R online (see forward()).
+        weight = self.weight
+        if self._hadamard_block_r:
+            R = _get_hadamard(self._hadamard_block_r, weight.device, weight.dtype)
+            self._hadamard_R = R
+            weight = _hadamard_rotate(weight, R)
+
         quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
-        weight_quant, weight_scale = quant_func(self.weight, shuffle=True)
+        weight_quant, weight_scale = quant_func(weight, shuffle=True)
         weight_shuffle = shuffle_weight(weight_quant, layout=(16, 16))
         
         # Register quantized tensors as buffers for proper state management
@@ -131,7 +212,12 @@ class xFuserMXFP4Linear(nn.Module):
         
         # Flatten all batch dimensions: [..., in_features] -> [M, in_features]
         input_2d = input.view(-1, self.in_features)
-        
+
+        # Online activation rotation, matching the offline weight rotation. Cheap
+        # (~block_r/out_features of the GEMM flops); no-op when Hadamard disabled.
+        if self._hadamard_R is not None:
+            input_2d = _hadamard_rotate(input_2d, self._hadamard_R)
+
         output = self.mm(
             input_2d,
             self.weight_shuffle,
