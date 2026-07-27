@@ -259,14 +259,21 @@ def _mxfp4_comms_input_all_to_all(query, key, value, is_f4f4=False):
     # over the *full* (post-a2a) sequence, so it must be computed here post-gather.
     # Both backends branch identically on the V wire format (v_bf16_comms).
     if is_f4f4:
-        # f4f4: per-channel fp4 (E2M1) V. The packer reads strides (no .contiguous())
-        # and packs from bf16 directly (no fp32 upcast); it returns a 128-padded view.
+        # f4f4 V pack (post-gather). AITER_F4F4_MXFP4_V selects microscaled mxfp4-V
+        # (per-(channel, 32-kv-block) E8M0) vs the default per-channel fp4. This MUST
+        # match the deployed fwd_hd128_f4f4.co build or the kernel reads garbage; it
+        # mirrors the fresh-path sage_quant_f4f4 toggle. The packer reads strides (no
+        # .contiguous()) and returns a 128-padded view.
         if v_bf16_comms:
             v_bshd = torch.permute(value, [0, 2, 1, 3])                     # bf16 [b, s, h, d]
         else:
             # naive fp8 comm -> upcast fp8->bf16 for the fp4 repack.
             v_bshd = torch.permute(value, [0, 2, 1, 3]).to(torch.bfloat16)  # [b, s, h, d]
-        value, v_descale = _pack_v_fp4_colmajor(v_bshd)                     # bshd fp4 view (128-padded)
+        if os.environ.get("AITER_F4F4_MXFP4_V", "0") != "0":
+            from aiter.ops.triton.quant.sage_attention_quant_wrappers import _pack_v_mxfp4_colmajor
+            value, v_descale = _pack_v_mxfp4_colmajor(v_bshd)               # microscaled (E8M0 block) V
+        else:
+            value, v_descale = _pack_v_fp4_colmajor(v_bshd)                 # per-channel fp4 V
         attn_kwargs_update["mxfp4_v_descale"] = v_descale
     else:
         # mxfp4: per-channel fp8 V.
