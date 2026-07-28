@@ -1,5 +1,6 @@
 import torch
 import math
+import os
 from typing import Optional, Union, Dict, Any, Tuple
 
 from diffusers.models.transformers.transformer_wan import WanAttnProcessor
@@ -16,6 +17,7 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sp_group,
     get_runtime_state,
+    get_ulysses_parallel_world_size,
 )
 from xfuser.core.distributed.attention_backend import SUPPORTS_PRE_QUANTIZATION_BACKENDS
 from xfuser.model_executor.layers.attention_processor import (
@@ -46,6 +48,65 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         # (SSTA / sparge) to receive layout info like `thw`. Cross-attention and
         # the I2V image-context sub-call below are dense, so they don't read it.
         self.attention_kwargs = attention_kwargs
+
+    def _maybe_mxfp4_out_layer(self, attn: "WanAttention", has_img: bool):
+        """Return the o_proj (xFuserMXFP4Linear) when the fused mxfp4 output-comms path
+        is eligible, else None (fall back to bf16/fp8 output all-to-all).
+
+        Enabled only when: MXFP4_COMMS_MXFP4_OUT is set, this is the sequence-parallel
+        self-attention, mxfp4 comms is on (Ulysses>1), and o_proj is an mxfp4 GEMM with
+        Hadamard rotation whose block divides head_dim (so per-head rotation before the
+        head-gather a2a is identical to rotating the flattened model_dim). Disabled for
+        I2V (``has_img``: the bf16 image-context add must precede o_proj)."""
+        if os.environ.get("MXFP4_COMMS_MXFP4_OUT", "0") == "0":
+            return None
+        if self.is_cross_attention or has_img:
+            return None
+        rs = get_runtime_state()
+        if not getattr(rs.runtime_config, "use_mxfp4_comms", False):
+            return None
+        if get_ulysses_parallel_world_size() <= 1:
+            return None
+
+        from xfuser.model_executor.layers.mxfp4_linear import (
+            xFuserMXFP4Linear,
+            xFuserHybridMXFP4Linear,
+        )
+        o_proj = attn.to_out[0]
+        if isinstance(o_proj, xFuserHybridMXFP4Linear):
+            # Per-step high/low switch: only fuse on low-precision (mxfp4) steps.
+            if getattr(rs, "use_high_precision_gemm", True):
+                return None
+            o_proj = o_proj.low_precision_linear
+        if not isinstance(o_proj, xFuserMXFP4Linear):
+            return None
+        if getattr(o_proj, "_hadamard_R", None) is None:
+            return None
+        block_r = getattr(o_proj, "_hadamard_block_r", 0)
+        head_dim = o_proj.in_features // attn.heads
+        if block_r <= 0 or head_dim % block_r != 0:
+            return None
+        return o_proj
+
+    def _apply_fused_out_comms(self, attn, o_proj, attn_out):
+        """Epilogue for the fused mxfp4 output-comms path.
+
+        ``attn_out = (a_fp4 [b, h, S/P, d/2], a_scale [b, h, S/P, d/32])`` (uint8) -- the
+        attention output was Hadamard-rotated + mxfp4-packed (fused Triton kernel) before the
+        head-gather a2a. Mirror the bf16 path's transpose(1,2)+flatten(2,3) on both, then feed
+        the pre-quantized activation straight into o_proj (skips the rotate+quant it would
+        otherwise redo). Stays inside the compiled graph (the fused kernel + e8m0 shuffle +
+        prequant GEMM are all compile-safe), so the output a2a overlaps surrounding compute."""
+        a_fp4, a_scale = attn_out
+        a_fp4 = a_fp4.transpose(1, 2).flatten(2, 3)       # [b, S/P, model_dim/2]
+        a_scale = a_scale.transpose(1, 2).flatten(2, 3)   # [b, S/P, model_dim/32]
+        batch_shape = a_fp4.shape[:-1]
+        hidden_states = o_proj.forward_prequantized(
+            a_fp4.reshape(-1, a_fp4.shape[-1]),
+            a_scale.reshape(-1, a_scale.shape[-1]),
+        ).view(*batch_shape, -1)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
 
     @staticmethod
     def _run_shared_fp6_projections(
@@ -222,7 +283,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.to(activation_dtype)
 
-        hidden_states = self.attention_function(
+        mxfp4_out_layer = self._maybe_mxfp4_out_layer(attn, hidden_states_img is not None)
+
+        attn_out = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
@@ -230,8 +293,17 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             use_fp8_comms=use_fp8_comms,
             attention_kwargs=self.attention_kwargs,
             head_balance_layer=attn,
+            mxfp4_out_layer=mxfp4_out_layer,
             **fp8_kwargs,
-        ).transpose(1, 2)
+        )
+
+        if isinstance(attn_out, tuple):
+            # Fused mxfp4 output comms (see _apply_fused_out_comms). Runs eagerly: the
+            # epilogue is post-collective (USP already graph-broke) and uses exotic
+            # fp4/e8m0 dtype reinterprets that inductor can't compile.
+            return self._apply_fused_out_comms(attn, mxfp4_out_layer, attn_out)
+
+        hidden_states = attn_out.transpose(1, 2)
 
         # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
         if not self.is_cross_attention and runtime_state.fp8_comms is not None:

@@ -89,6 +89,37 @@ def _(a: torch.Tensor, w_quant: torch.Tensor, w_scale: torch.Tensor, bias: Optio
     # Return fake tensor with correct shape
     return torch.empty(M, N, dtype=a.dtype, device=a.device)
 
+
+@torch.library.custom_op("mylib::mxfp4_gemm_prequant", mutates_args=())
+def _mxfp4_gemm_prequant(a_fp4: torch.Tensor, w_quant: torch.Tensor, a_scale: torch.Tensor, w_scale: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """MXFP4 GEMM for an already-quantized activation (fp4 payload + *shuffled* E8M0
+    scale). Skips the per-1x32 quant of _mxfp4_gemm -- used when the activation was
+    quantized upstream (e.g. Hadamard-rotated + mxfp4-packed before the output
+    all-to-all, then fed straight into o_proj)."""
+    return aiter.gemm_a4w4(a_fp4, w_quant, a_scale, w_scale, bpreshuffle=True, bias=bias)
+
+
+@_mxfp4_gemm_prequant.register_fake
+def _(a_fp4: torch.Tensor, w_quant: torch.Tensor, a_scale: torch.Tensor, w_scale: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    M = a_fp4.shape[0]
+    N = w_quant.shape[0]
+    return torch.empty(M, N, dtype=torch.bfloat16, device=a_fp4.device)
+
+
+def rotate_quant_natural(x: torch.Tensor, layer: "xFuserMXFP4Linear"):
+    """Apply ``layer``'s Hadamard rotation (if enabled) then per-1x32 mxfp4 quant with
+    the *natural* (unshuffled) E8M0 scale. The fp4 payload and the natural per-32-block
+    scale are all-to-all-invariant (block is along the packed axis), so this can be run
+    before a head-gather a2a and reassembled; the shuffle is applied later in
+    ``forward_prequantized``. Returns ``(a_fp4 [.., K/2], a_scale [.., K/32])``."""
+    R = getattr(layer, "_hadamard_R", None)
+    if R is not None:
+        x = _hadamard_rotate(x, R)
+    quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+    a_fp4, a_scale = quant_func(x, shuffle=False)
+    return a_fp4, a_scale
+
+
 class xFuserMXFP4Linear(nn.Module):
     """
     Custom Linear layer using MXFP4 GEMM operation
@@ -232,7 +263,32 @@ class xFuserMXFP4Linear(nn.Module):
         output = output.view(*original_shape[:-1], self.out_features)
         
         return output
-    
+
+    def forward_prequantized(self, a_fp4: torch.Tensor, a_scale_natural: torch.Tensor) -> torch.Tensor:
+        """Forward for an activation already Hadamard-rotated + mxfp4-quantized upstream
+        (e.g. packed before the output all-to-all). ``a_fp4`` is [M, K/2] fp4x2 and
+        ``a_scale_natural`` is the [M, K/32] *unshuffled* E8M0 scale (a2a-invariant); we
+        apply the E8M0 shuffle here and run the GEMM directly -- no rotate, no re-quant.
+        The weight is already Hadamard-folded + shuffled, so (A R)(W R)^T == A W^T.
+
+        ``a_fp4``/``a_scale_natural`` may arrive as raw uint8 (e.g. after a byte-level
+        all-to-all, which the fp4/e8m0 dtypes don't support): reinterpret them back to
+        the packed fp4 / E8M0 dtypes before the shuffle+GEMM (pure bit-reinterpret)."""
+        from aiter.utility import fp4_utils
+        if not hasattr(self, "weight_shuffle"):
+            self._quantize_weights()
+        if a_fp4.dtype == torch.uint8:
+            a_fp4 = a_fp4.view(torch.float4_e2m1fn_x2)
+        if a_scale_natural.dtype == torch.uint8:
+            a_scale_natural = a_scale_natural.view(torch.float8_e8m0fnu)
+        a_scale = fp4_utils.e8m0_shuffle(a_scale_natural)
+        output = torch.ops.mylib.mxfp4_gemm_prequant(
+            a_fp4, self.weight_shuffle, a_scale, self.weight_scale, None
+        )
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
     def extra_repr(self):
         """String representation (for print(model))"""
         return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}'

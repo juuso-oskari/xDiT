@@ -363,6 +363,99 @@ def _mxfp4_comms_output_all_to_all(out: torch.Tensor) -> torch.Tensor:
     return out_fp8.to(restore_dtype)
 
 
+def _rotate_downcast_mxfp4_single(x, R, block_r, block_m, sm_scale=1.0, layout="bhsd"):
+    """Single-tensor Hadamard-rotate + per-1x32 mxfp4 downcast.
+
+    This is exactly the *q-half* of aiter's ``smooth_rotate_downcast_qk`` (same Triton kernel,
+    same args) but for ONE tensor -- no wasted second (k) rotate/quant pass and no K_q/K_descale
+    buffers. Being a Triton kernel it stays inside the torch.compile graph (compile-safe).
+
+    ``x`` is [b, h, s, d] (bhsd) or [b, s, h, d] (bshd). Returns
+    ``(x_fp4 [.., d/2] uint8, x_scale [.., d/32] uint8)`` in x's layout: packed fp4 payload +
+    natural (unshuffled) per-32 E8M0 block scale.
+    """
+    from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
+        _rotate_quantize_q_kernel,
+    )
+    from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
+
+    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    b, s, h, d = map_dims(x.shape, bshd)
+    num_blks = (s + block_m - 1) // block_m
+    # map_dims returns (b, m/seq, h, d)-order strides.
+    stride_xb, stride_xm, stride_xh, stride_xd = map_dims(x.stride(), bshd)
+
+    x_fp4 = torch.empty((*x.shape[:-1], d // 2), dtype=torch.uint8, device=x.device)
+    x_scale = torch.empty((*x.shape[:-1], d // 32), dtype=torch.uint8, device=x.device)
+    stride_qqb, stride_qqm, stride_qqh, stride_qqd = map_dims(x_fp4.stride(), bshd)
+    stride_qsb, stride_qsm, stride_qsh, stride_qsd = map_dims(x_scale.stride(), bshd)
+
+    grid = (b * h * num_blks,)
+    # Arg order mirrors smooth_rotate_downcast_qk's q launch EXACTLY: the input strides are
+    # passed (b, h, m, d) while the fp4/scale output strides are (b, m, h, d).
+    _rotate_quantize_q_kernel[grid](
+        x, x_fp4, x_scale, None, R, sm_scale,
+        stride_xb, stride_xh, stride_xm, stride_xd,
+        stride_qqb, stride_qqm, stride_qqh, stride_qqd,
+        stride_qsb, stride_qsm, stride_qsh, stride_qsd,
+        None, None, None, None,          # Q_mean strides (q_smoothing=False)
+        b, h, s, d,
+        q_smoothing=False,
+        hadamard_rotation=True,
+        BLOCK_M=block_m,
+        BLOCK_R=block_r,
+        D=d,
+        num_warps=4,
+        num_stages=5,
+    )
+    return x_fp4, x_scale
+
+
+def _mxfp4_comms_output_all_to_all_fused(out: torch.Tensor, o_proj_layer):
+    """Fused mxfp4 output all-to-all for the mxfp4-comms path.
+
+    Hadamard-rotates + mxfp4-quantizes the attention output *before* the head-gather a2a
+    (using ``o_proj_layer``'s rotation), so only the packed fp4 (head_dim/2 bytes) + its
+    E8M0 block scale (head_dim/32) cross the wire (~4x smaller than bf16); o_proj then
+    consumes the pre-quantized activation directly (``forward_prequantized``) -- no dequant,
+    no re-rotate, no re-quant on-device.
+
+    Uses the SAME fused Triton rotate+mxfp4 kernel as the Q/K comms path
+    (``smooth_rotate_downcast_qk``). This is deliberate: the kernel stays *inside* the
+    torch.compile graph, so the output a2a overlaps the surrounding compute exactly like the
+    Q/K collectives. (The earlier ``aiter.get_hip_quant`` path was a multi-output custom op
+    that tripped inductor's ``auto_functionalized_v2`` and forced a graph break, which killed
+    the QKV comm/compute overlap.)
+
+    The Hadamard R (``o_proj``'s ``block_r``, tiling head_dim) and the per-32 mxfp4 block both
+    tile head_dim, and the a2a only permutes b/h/s -> quantizing per (b, local-head, seq) here
+    and gathering is equivalent to quantizing the flattened [.., model_dim] activation after
+    the gather (matches ``o_proj``'s offline weight fold with the same R).
+
+    ``out`` is [b, h/P, S, d] (bhsd, local heads, full seq). Returns a *tuple*
+    ``(a_fp4, a_scale)`` (uint8) gathered to [b, h, S/P, d/2] and [b, h, S/P, d/32]; the
+    processor flattens heads and feeds it to ``o_proj_layer.forward_prequantized``.
+    """
+    from xfuser.core.distributed.attention_backend import _AITER_SPARGE_ASM_BLOCK_M
+
+    # Fused rotate (o_proj's Hadamard) + per-1x32 mxfp4 downcast in one Triton kernel, on the
+    # single output tensor (no double-quant). sm_scale=1.0 -> no softmax scaling (the output
+    # projection wants the raw rotated activation). Outputs: uint8 fp4 [b,h/P,S,d/2] + uint8
+    # natural E8M0 scale [b,h/P,S,d/32].
+    a_fp4, a_scale = _rotate_downcast_mxfp4_single(
+        out,
+        R=o_proj_layer._hadamard_R,
+        block_r=o_proj_layer._hadamard_block_r,
+        block_m=_AITER_SPARGE_ASM_BLOCK_M,
+        sm_scale=1.0,
+        layout="bhsd",
+    )
+    # a2a gathers heads (permutes b/h/s only) -> the per-head-block fp4/scale is preserved.
+    a_fp4 = _ft_c_output_all_to_all(a_fp4)
+    a_scale = _ft_c_output_all_to_all(a_scale)
+    return a_fp4, a_scale
+
+
 def _combined_qkv_all_to_all(q, k, v):
     """Concatenate query, key, value tensors and perform a single all-to-all communication."""
     world_size = get_ulysses_parallel_world_size()
@@ -520,6 +613,7 @@ def USP(
         fp8_v_scale: torch.Tensor | None = None,
         fp8_o_scale: torch.Tensor | None = None,
         fp8_comms_synced: bool = False,
+        mxfp4_out_layer=None,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -657,6 +751,12 @@ def USP(
                     "FP8 comms requires per-layer scale buffers fp8_o_scale"
                 )
             out = _fp8_comms_output_all_to_all(out, fp8_o_scale)
+        elif mxfp4_out_layer is not None and not hb_applied:
+            # Fused mxfp4 output comms: rotate+quant the output with o_proj's Hadamard,
+            # ship packed fp4 + E8M0 scale, and hand the pre-quantized activation to
+            # o_proj.forward_prequantized. Returns a (a_fp4, a_scale) tuple that the
+            # processor detects and routes (no dequant/re-quant on-device).
+            out = _mxfp4_comms_output_all_to_all_fused(out, mxfp4_out_layer)
         elif (
             get_runtime_state().runtime_config.use_mxfp4_comms
             and getattr(hb_backend, "name", None) in _MXFP4_COMMS_BACKENDS
@@ -688,6 +788,7 @@ def attention(
         fp8_q_scale: torch.Tensor | None = None,
         fp8_k_scale: torch.Tensor | None = None,
         fp8_v_scale: torch.Tensor | None = None,
+        mxfp4_out_layer=None,
     ):
     """
     Runs attention call without any parallelism.
