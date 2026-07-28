@@ -382,7 +382,7 @@ if env_info["has_aiter"]:
         from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
             sage_quant_mxfp4,
             sage_quant_f4f4,
-            _pack_v_fp4_colmajor,
+            _pack_v_mxfp4_colmajor,
             _pack_v_fp8_perchannel,
         )
         from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import (
@@ -811,8 +811,8 @@ def _aiter_i8fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kw
 
 
 # ---------------------------------------------------------------------------
-# f4f4 (fp4 Q/K + per-channel fp4 V) support. V is packed with the shared in-tree aiter
-# quantizer: sage_quant_f4f4 for the fresh path, and its V half _pack_v_fp4_colmajor
+# f4f4 (mxfp4 Q/K + microscaled mxfp4 V) support. V is packed with the shared in-tree aiter
+# quantizer: sage_quant_f4f4 for the fresh path, and its V half _pack_v_mxfp4_colmajor
 # (imported above) for the mxfp4-comms path where Q/K arrive already fp4-packed. No
 # external host-packer dep and no local V-quant kernel caller.
 # ---------------------------------------------------------------------------
@@ -855,13 +855,14 @@ def _f4f4_pad_bshd_seq(t, s_pad):
 
 @register_attention_function(AttentionBackendType.AITER_F4F4)
 def _aiter_f4f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    """f4f4 backend: mxfp4 Q/K + per-channel fp4 (E2M1) V (fwd_hd128_f4f4.co).
+    """f4f4 backend: mxfp4 Q/K + microscaled mxfp4 V -- E2M1 payload with per-(dv-channel,
+    32-kv-block) E8M0 block scales, mirroring Q/K (fwd_hd128_f4f4.co).
 
     * mxfp4-comms (mxfp4_pre_quantized): Q/K arrive already fp4-packed -> unpack them
-      (shared helper); V is already packed to per-channel fp4 in usp (its descale comes
-      via attention_kwargs), so just dispatch.
+      (shared helper); V is already packed to microscaled mxfp4 in usp (its E8M0 block-scale
+      image arrives via attention_kwargs as a uint8 tensor), so just dispatch.
     * fresh: a single in-tree sage_quant_f4f4 pass quantizes Q/K to mxfp4 and packs V
-      to per-channel fp4 (mirrors bench_sage.py::make_f4f4_runner).
+      to microscaled mxfp4 (mirrors bench_sage.py::make_f4f4_runner).
 
     The f4f4 kernel only supports a KV length that is a multiple of 128 (unlike mxfp4,
     it does not mask a partial last KV tile -> NaNs on ragged lengths). Video sequences
@@ -874,10 +875,10 @@ def _aiter_f4f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwa
 
     if attention_kwargs.get("mxfp4_pre_quantized", False):
         qq, qd, kq, kd = _mxfp4_comms_unpack_qk(query, key, attention_kwargs)  # bshd, true s
-        # V was packed to per-channel fp4 in usp; the view is already 128-padded
+        # V was packed to microscaled mxfp4 in usp; the view is already 128-padded
         # (bshd [b, kv_pad, h, 128]); pass it straight through (never .contiguous()).
         v_fp4 = value
-        v_descale = attention_kwargs["mxfp4_v_descale"]
+        v_descale = attention_kwargs["mxfp4_v_descale"]   # uint8 E8M0 block-scale image
         # Pad only K to V's 128-rounded length so seqlen_k is a multiple of 128 (no-mask
         # kernel path). Q stays ragged -> output is the true query length (no pad, no slice).
         s_pad = v_fp4.shape[1]                          # kv_pad (multiple of 128)
@@ -886,7 +887,10 @@ def _aiter_f4f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwa
         softmax_scale = (qq.shape[-1] * 2) ** -0.5
         out_bshd = flash_attn_f4f4_pertensor_func(
             qq, kq, v_fp4,
-            qd, kd, v_descale.to(torch.float32).contiguous(),
+            # v_descale is the uint8 E8M0 block-scale image straight from _pack_v_mxfp4_colmajor;
+            # pass it through untouched. Do NOT add .to(float32)/.contiguous() -- a numeric cast
+            # would corrupt the E8M0 bytes; the packer owns the wire dtype/layout.
+            qd, kd, v_descale,
             softmax_scale=float(softmax_scale),
         )
         return torch.permute(out_bshd, [0, 2, 1, 3]), None
@@ -894,7 +898,7 @@ def _aiter_f4f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwa
     q_bshd = torch.permute(query, [0, 2, 1, 3]).contiguous()
     k_bshd = torch.permute(key,   [0, 2, 1, 3]).contiguous()
     v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
-    # sage_quant_f4f4 packs V per-channel fp4, which needs kv_len % 128 == 0; pad only K/V.
+    # sage_quant_f4f4 packs V to microscaled mxfp4, which needs kv_len % 128 == 0; pad only K/V.
     # Q is tiled/bounded independently (quantized separately from K), so it stays ragged and
     # the output keeps the true query length -> no pad on Q, no output slice.
     s_pad = ((k_bshd.shape[1] + 127) // 128) * 128
@@ -914,7 +918,7 @@ def _aiter_f4f4_attn_call(query, key, value, dropout_p, is_causal, attention_kwa
     softmax_scale = (qq.shape[-1] * 2) ** -0.5
     out_bshd = flash_attn_f4f4_pertensor_func(
         qq.contiguous(), kq.contiguous(), v_fp4,
-        qd.contiguous(), kd.contiguous(), v_descale.to(torch.float32).contiguous(),
+        qd.contiguous(), kd.contiguous(), v_descale,   # uint8 E8M0 image from the packer (no cast)
         softmax_scale=float(softmax_scale),
     )
     return torch.permute(out_bshd, [0, 2, 1, 3]), None

@@ -630,7 +630,7 @@ class RuntimeState(metaclass=ABCMeta):
                 from aiter.ops.mha import flash_attn_f4f4_pertensor_func
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
                     sage_quant_f4f4,
-                    _pack_v_fp4_colmajor,
+                    _pack_v_mxfp4_colmajor,
                 )
             except ImportError:
                 raise RuntimeError(
@@ -639,7 +639,7 @@ class RuntimeState(metaclass=ABCMeta):
                     "path aiter.ops.mha.flash_attn_f4f4_pertensor_func (the compile-op "
                     "fmha_v3_fwd_f4f4; no AITER_FMHA_F4F4 env var) and the in-tree fp4 "
                     "quantizer aiter.ops.triton.quant.sage_attention_quant_wrappers."
-                    "sage_quant_f4f4 (plus its shared V packer _pack_v_fp4_colmajor "
+                    "sage_quant_f4f4 (plus its shared V packer _pack_v_mxfp4_colmajor "
                     "for the mxfp4-comms path)."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
