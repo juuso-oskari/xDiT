@@ -48,7 +48,7 @@ from xfuser.core.distributed.attention_backend import (
     AttentionBackendType,
     SUPPORTS_PRE_QUANTIZATION_BACKENDS,
 )
-from xfuser.core.distributed.attention_schedule import AttentionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
+from xfuser.core.distributed.attention_schedule import AttentionSchedule, GemmPrecisionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
 
 
 packages_info = PACKAGES_CHECKER.get_packages_info()
@@ -1030,20 +1030,47 @@ class xFuserModel(abc.ABC):
 
     def _setup_hybrid_gemm_schedule(self, input_args: dict) -> None:
         """
-        Setup hybrid GEMM schedule: high precision FP8 GEMMs at start/end, MXFP4 GEMMs in the middle.
+        Setup hybrid GEMM schedule.
+
+        When an explicit ``hybrid_attn_schedule`` string is used, the GEMM schedule MIRRORS it:
+        a step uses high-precision (FP8) GEMMs iff its attention backend is not an mxfp4/f4f4
+        backend. This aligns GEMM precision with attention precision per step (e.g. mxfp4+Hadamard
+        GEMMs on the mxfp4/f4f4-attention steps, FP8 GEMMs on the FP8-attention tail) rather than
+        the symmetric start/end pattern. Otherwise it falls back to the symmetric high-precision
+        schedule (FP8 GEMMs at start/end, mxfp4 in the middle).
         """
         if input_args["num_hybrid_gemm_high_precision_steps"] is None:
             raise ValueError("You must provide 'num_hybrid_gemm_high_precision_steps' to use the hybrid GEMM schedule.")
         multiplier = self._calculate_hybrid_attention_step_multiplier(input_args)
         total_steps = input_args["num_inference_steps"] * multiplier
-        num_high_precision_steps = input_args["num_hybrid_gemm_high_precision_steps"] * multiplier
 
-        gemm_schedule = create_hybrid_gemm_schedule(
-            num_high_precision_steps=num_high_precision_steps,
-            total_steps=total_steps,
+        use_explicit_attn_schedule = (
+            self.config.hybrid_attn_low_precision_backend is None
+            or self.config.hybrid_attn_high_precision_backend is None
         )
+        if use_explicit_attn_schedule and self.config.hybrid_attn_schedule:
+            attn_schedule = AttentionSchedule.from_comma_delimited_string(self.config.hybrid_attn_schedule)
+            if attn_schedule.total_steps != total_steps:
+                raise ValueError(
+                    f"Hybrid GEMM schedule mirrored from attention has total steps "
+                    f"{attn_schedule.total_steps} which does not match input steps {total_steps}."
+                )
+            # mxfp4/f4f4-attention steps -> mxfp4 GEMMs (low precision); any other attention
+            # backend (e.g. FP8) -> FP8 GEMMs (high precision).
+            _MXFP4_ATTN_BACKENDS = {"AITER_MXFP4", "AITER_F4F4"}
+            use_high_precision_schedule = [
+                backend.name not in _MXFP4_ATTN_BACKENDS for backend in attn_schedule.backends
+            ]
+            gemm_schedule = GemmPrecisionSchedule(use_high_precision_schedule)
+            log("Enabling hybrid GEMM schedule (mirrored from explicit attention schedule)")
+        else:
+            num_high_precision_steps = input_args["num_hybrid_gemm_high_precision_steps"] * multiplier
+            gemm_schedule = create_hybrid_gemm_schedule(
+                num_high_precision_steps=num_high_precision_steps,
+                total_steps=total_steps,
+            )
+            log("Enabling hybrid GEMM schedule (symmetric start/end)")
 
-        log("Enabling hybrid GEMM schedule")
         log(f"Hybrid GEMM schedule (high precision=True): {gemm_schedule.use_high_precision_schedule}", debug=True)
         get_runtime_state().set_gemm_schedule(gemm_schedule, total_steps=total_steps)
 

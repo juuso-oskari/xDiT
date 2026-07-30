@@ -1,4 +1,5 @@
 import copy
+import os
 import re
 import torch
 from dataclasses import replace
@@ -541,6 +542,15 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
                 "dtype": torch.bfloat16,
         }
         self.settings.fp8_gemm_module_list=["transformer.blocks", "transformer_2.blocks"]
+        # Default (champion): high-noise `transformer` = mxfp4+Hadamard GEMMs, low-noise
+        # `transformer_2` = FP8 GEMMs.
+        # Opt-in (XFUSER_FP4_LOW_NOISE_EXPERT=1): push `transformer_2` to mxfp4+Hadamard GEMMs too
+        # (more aggressive mxfp4). FP8 GEMMs are then re-introduced only on the fp8-attention tail
+        # via the hybrid GEMM schedule (see _setup_hybrid_gemm_schedule mirroring the attention
+        # schedule). transformer_2.blocks is in both lists, but the fp8 loop skips any module
+        # already in fp4_gemm_module_list, so it resolves to mxfp4 (hybrid when enabled).
+        if os.environ.get("XFUSER_FP4_LOW_NOISE_EXPERT", "0") != "0":
+            self.settings.fp4_gemm_module_list=["transformer.blocks", "transformer_2.blocks"]
         self.settings.fp8_precision_overrides=None
 
     def _load_model(self) -> DiffusionPipeline:
